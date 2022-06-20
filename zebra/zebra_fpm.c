@@ -69,6 +69,14 @@ DEFINE_MTYPE_STATIC(ZEBRA, FPM_MAC_INFO, "FPM_MAC_INFO");
 #define ZFPM_STATS_IVL_SECS        10
 #define FPM_MAX_MAC_MSG_LEN 512
 
+/*
+ * Default keepalive interval.
+ */
+#define ZFPM_KEEPALIVE_IVL_SECS    2
+
+#define FPM_STR "Forwarding Plane Manager configuration\n"
+
+
 static void zfpm_iterate_rmac_table(struct hash_bucket *bucket, void *args);
 
 /*
@@ -103,6 +111,8 @@ struct zfpm_stats {
 	unsigned long redundant_triggers;
 
 	unsigned long dests_del_after_update;
+
+	unsigned long keepalive_cb_calls;
 
 	unsigned long t_conn_down_starts;
 	unsigned long t_conn_down_dests_processed;
@@ -239,6 +249,13 @@ struct zfpm_glob {
 	 */
 	struct thread *t_conn_up;
 
+	/*
+	 * Thread to send keepalive messages periodically.
+	 */
+	struct thread *t_keepalive;
+
+	uint32_t keepalive_ivl;
+
 	struct {
 		struct zfpm_rnodes_iter iter;
 	} t_conn_up_state;
@@ -286,6 +303,8 @@ static int zfpm_trigger_update(struct route_node *rn, const char *reason);
 
 static void zfpm_read_cb(struct thread *thread);
 static void zfpm_write_cb(struct thread *thread);
+static void zfpm_keepalive_cb (struct thread *thread);
+static int zfpm_create_keepalive (struct thread *thread);
 
 static void zfpm_set_state(enum zfpm_state state, const char *reason);
 static void zfpm_start_connect_timer(const char *reason);
@@ -512,6 +531,22 @@ static inline void zfpm_connect_off(void)
 	thread_cancel(&zfpm_g->t_connect);
 }
 
+static inline void zfpm_keepalive_on(void)
+{
+	zfpm_g->t_keepalive = NULL;
+	assert (!zfpm_g->t_keepalive);
+
+	thread_add_timer(zfpm_g->master, zfpm_keepalive_cb, 0, zfpm_g->keepalive_ivl,
+			&zfpm_g->t_keepalive);
+}
+
+static inline void zfpm_keepalive_off(void)
+{
+	if (zfpm_g->t_keepalive) {
+		thread_cancel(&zfpm_g->t_keepalive);
+	}
+}
+
 /*
  * zfpm_conn_up_thread_cb
  *
@@ -569,6 +604,57 @@ done:
 }
 
 /*
+ * zfpm_keepalive_cb
+ *
+ * Called when the keepalive timer expires.
+ */
+static void
+zfpm_keepalive_cb (struct thread *thread)
+{
+	zfpm_g->stats.keepalive_cb_calls++;
+
+	zfpm_create_keepalive(thread);
+	zfpm_write_on();
+	zfpm_keepalive_on();
+
+	return;
+}
+
+/*
+ * zfpm_create_keepalive.
+ *
+ * Creates a keepalive message and writes it to the output buffer
+ * ready for sending.
+ */
+static int
+zfpm_create_keepalive (struct thread *thread)
+{
+	fpm_msg_hdr_t *hdr;
+	struct stream *s;
+	unsigned char *buf;
+	uint msg_len = FPM_MSG_HDR_LEN;
+
+	s = zfpm_g->obuf;
+
+	if (STREAM_WRITEABLE (s) < msg_len) {
+		return 1;
+	}
+
+	buf = STREAM_DATA (s) + stream_get_endp (s);
+
+	hdr = (fpm_msg_hdr_t *) buf;
+
+	hdr->version = FPM_PROTO_VERSION;
+	hdr->msg_type = FPM_MSG_TYPE_KEEPALIVE;
+	hdr->msg_len = htons(msg_len);
+
+	stream_forward_endp (s, msg_len);
+
+	return 0;
+}
+
+
+/*
  * zfpm_connection_up
  *
  * Called when the connection to the FPM comes up.
@@ -593,6 +679,9 @@ static void zfpm_connection_up(const char *detail)
 	thread_add_timer_msec(zfpm_g->master, zfpm_conn_up_thread_cb, NULL, 0,
 			      &zfpm_g->t_conn_up);
 	zfpm_g->stats.t_conn_up_starts++;
+
+	zfpm_debug ("Starting keepalive thread");
+	zfpm_keepalive_on();
 }
 
 /*
@@ -690,6 +779,8 @@ static void zfpm_conn_down_thread_cb(struct thread *thread)
 
 	zfpm_g->stats.t_conn_down_finishes++;
 	zfpm_rnodes_iter_cleanup(iter);
+
+	zfpm_keepalive_off();
 
 	/*
 	 * Start the process of connecting to the FPM again.
@@ -1741,6 +1832,7 @@ static void zfpm_show_stats(struct vty *vty)
 	ZFPM_SHOW_STAT(updates_triggered);
 	ZFPM_SHOW_STAT(redundant_triggers);
 	ZFPM_SHOW_STAT(dests_del_after_update);
+	ZFPM_SHOW_STAT(keepalive_cb_calls);
 	ZFPM_SHOW_STAT(t_conn_down_starts);
 	ZFPM_SHOW_STAT(t_conn_down_dests_processed);
 	ZFPM_SHOW_STAT(t_conn_down_yields);
@@ -1859,6 +1951,45 @@ DEFUN ( no_fpm_remote_ip,
 	return CMD_SUCCESS;
 }
 
+DEFUN ( fpm_keepalive_timer,
+		fpm_keepalive_timer_cmd,
+		"fpm keepalive timer <1-65535>",
+		FPM_STR
+		"Keepalive configuration\n"
+		"Keepalive timer\n"
+		"Keepalive timer value in seconds")
+{
+	uint32_t timer;
+
+	timer = atoi (argv[0]);
+
+	zfpm_g->keepalive_ivl = timer;
+
+	return CMD_SUCCESS;
+}
+
+DEFUN ( no_fpm_keepalive_timer,
+		no_fpm_keepalive_timer_cmd,
+		"no fpm keepalive timer <1-65535>",
+		NO_STR
+		FPM_STR
+		"Keepalive configuration\n"
+		"Keepalive timer\n"
+		"Keepalive timer value in seconds")
+{
+	uint32_t timer;
+
+	timer = atoi (argv[0]);
+
+	if (zfpm_g->keepalive_ivl != timer) {
+		return CMD_ERR_NO_MATCH;
+	}
+
+	zfpm_g->keepalive_ivl = ZFPM_KEEPALIVE_IVL_SECS;
+
+	return CMD_SUCCESS;
+}
+
 /*
  * zfpm_init_message_format
  */
@@ -1936,6 +2067,10 @@ static int fpm_remote_srv_write(struct vty *vty)
 		vty_out(vty, "fpm connection ip %pI4 port %d\n", &in,
 			zfpm_g->fpm_port);
 
+	if (zfpm_g->keepalive_ivl != ZFPM_KEEPALIVE_IVL_SECS) {
+		vty_out (vty, "fpm keepalive timer %d\n", zfpm_g->keepalive_ivl);
+	}
+
 	return 0;
 }
 
@@ -1992,6 +2127,8 @@ static int zfpm_init(struct thread_master *master)
 	install_node(&zebra_node);
 	install_element(ENABLE_NODE, &show_zebra_fpm_stats_cmd);
 	install_element(ENABLE_NODE, &clear_zebra_fpm_stats_cmd);
+	install_element(CONFIG_NODE, &fpm_keepalive_timer_cmd);
+	install_element(CONFIG_NODE, &no_fpm_keepalive_timer_cmd);
 	install_element(CONFIG_NODE, &fpm_remote_ip_cmd);
 	install_element(CONFIG_NODE, &no_fpm_remote_ip_cmd);
 
@@ -2012,6 +2149,9 @@ static int zfpm_init(struct thread_master *master)
 		port = FPM_DEFAULT_PORT;
 
 	zfpm_g->fpm_port = port;
+
+	if (!zfpm_g->keepalive_ivl)
+		zfpm_g->keepalive_ivl = ZFPM_KEEPALIVE_IVL_SECS;
 
 	zfpm_g->obuf = stream_new(ZFPM_OBUF_SIZE);
 	zfpm_g->ibuf = stream_new(ZFPM_IBUF_SIZE);
